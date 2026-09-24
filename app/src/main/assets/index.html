@@ -31,8 +31,52 @@
   </section>
   <div class="footer"><div class="footer-frame"><img src="footer.svg" alt="Logos institucionais UERJ, PR3, Decult UERJ e COART"></div></div>
 </main>
-<audio id="radio" preload="none" playsinline src="https://servidor37-2.brlogic.com:7144/live"></audio>
 <script>
-(()=>{const radio=document.getElementById('radio'),btn=document.getElementById('playBtn'),icon=document.getElementById('playIcon'),txt=document.getElementById('playText'),status=document.getElementById('status'),volume=document.getElementById('volume');radio.volume=Number(volume.value);function ui(p){icon.textContent=p?'❚❚':'▶';txt.textContent=p?'PAUSAR TRANSMISSÃO':'OUVIR AO VIVO'}async function play(){status.textContent='Conectando ao Plataforma Livre...';try{await radio.play();ui(true);status.textContent='Você está ouvindo o Plataforma Livre ao vivo.'}catch(e){ui(false);status.textContent='Não foi possível iniciar. Toque novamente.'}}function pause(){radio.pause();ui(false);status.textContent='Transmissão pausada.'}btn.addEventListener('click',()=>radio.paused?play():pause());volume.addEventListener('input',()=>radio.volume=Number(volume.value));radio.addEventListener('playing',()=>{ui(true);status.textContent='Você está ouvindo o Plataforma Livre ao vivo.'});radio.addEventListener('waiting',()=>status.textContent='Carregando transmissão...');radio.addEventListener('stalled',()=>status.textContent='A conexão está lenta. Tentando continuar...');radio.addEventListener('error',()=>{ui(false);status.textContent='Não foi possível conectar à transmissão. Tente novamente.'});})();
+(()=>{
+  const btn=document.getElementById('playBtn');
+  const icon=document.getElementById('playIcon');
+  const txt=document.getElementById('playText');
+  const status=document.getElementById('status');
+  const volume=document.getElementById('volume');
+  let active=false;
+
+  function setState(on,message){
+    active=!!on;
+    icon.textContent=active?'■':'▶';
+    txt.textContent=active?'PARAR TRANSMISSÃO':'OUVIR AO VIVO';
+    status.textContent=message || (active?'Você está ouvindo o Plataforma Livre ao vivo.':'Toque no botão para iniciar a transmissão.');
+  }
+
+  window.setNativeState=setState;
+
+  try{
+    if(window.AndroidRadio) setState(AndroidRadio.isActive(), AndroidRadio.isActive()?'Transmissão ativa. Você pode bloquear a tela.':'Toque no botão para iniciar a transmissão.');
+  }catch(e){ setState(false); }
+
+  btn.addEventListener('click',()=>{
+    try{
+      if(!window.AndroidRadio){
+        status.textContent='Este recurso requer o aplicativo Android.';
+        return;
+      }
+      if(active){
+        AndroidRadio.stop();
+        setState(false,'Transmissão parada. Ao tocar novamente, o app reconecta ao ponto atual do ao vivo.');
+      }else{
+        status.textContent='Conectando ao Plataforma Livre...';
+        AndroidRadio.play(Number(volume.value));
+        setState(true,'Conectando ao Plataforma Livre...');
+      }
+    }catch(e){
+      setState(false,'Não foi possível iniciar a transmissão. Tente novamente.');
+    }
+  });
+
+  volume.addEventListener('input',()=>{
+    try{
+      if(window.AndroidRadio && active) AndroidRadio.setVolume(Number(volume.value));
+    }catch(e){}
+  });
+})();
 </script>
 </body></html>
