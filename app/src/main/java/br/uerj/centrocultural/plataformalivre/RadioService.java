@@ -34,6 +34,7 @@ public class RadioService extends Service {
     private MediaSession mediaSession;
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
+    private AudioManager.OnAudioFocusChangeListener focusChangeListener;
     private float volume = 0.85f;
 
     public static boolean isActive() { return active; }
@@ -114,7 +115,7 @@ public class RadioService extends Service {
                     playing = false;
                     releasePlayer();
                     updatePlaybackState(PlaybackState.STATE_ERROR);
-                    stopForeground(STOP_FOREGROUND_REMOVE);
+                    removeForegroundNotification();
                     stopSelf();
                 }
                 return true;
@@ -126,7 +127,7 @@ public class RadioService extends Service {
             playing = false;
             releasePlayer();
             updatePlaybackState(PlaybackState.STATE_ERROR);
-            stopForeground(STOP_FOREGROUND_REMOVE);
+            removeForegroundNotification();
             stopSelf();
         }
     }
@@ -137,7 +138,7 @@ public class RadioService extends Service {
         releasePlayer();
         abandonAudioFocus();
         updatePlaybackState(PlaybackState.STATE_STOPPED);
-        stopForeground(STOP_FOREGROUND_REMOVE);
+        removeForegroundNotification();
         stopSelf();
     }
 
@@ -161,7 +162,7 @@ public class RadioService extends Service {
 
     private void requestAudioFocus() {
         if (audioManager == null) return;
-        AudioManager.OnAudioFocusChangeListener listener = focusChange -> {
+        focusChangeListener = focusChange -> {
             if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
                 stopPlayback();
             } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
@@ -179,11 +180,11 @@ public class RadioService extends Service {
                             .setUsage(AudioAttributes.USAGE_MEDIA)
                             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                             .build())
-                    .setOnAudioFocusChangeListener(listener)
+                    .setOnAudioFocusChangeListener(focusChangeListener)
                     .build();
             audioManager.requestAudioFocus(focusRequest);
         } else {
-            audioManager.requestAudioFocus(listener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+            audioManager.requestAudioFocus(focusChangeListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
         }
     }
 
@@ -192,7 +193,15 @@ public class RadioService extends Service {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && focusRequest != null) {
             audioManager.abandonAudioFocusRequest(focusRequest);
             focusRequest = null;
+        } else if (focusChangeListener != null) {
+            audioManager.abandonAudioFocus(focusChangeListener);
         }
+        focusChangeListener = null;
+    }
+
+    private void removeForegroundNotification() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE);
+        else stopForeground(true);
     }
 
     private void createNotificationChannel() {
