@@ -4,7 +4,10 @@ import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
@@ -21,6 +24,16 @@ import android.webkit.WebViewClient;
 public class MainActivity extends Activity {
     private WebView webView;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 2001;
+    private boolean receiverRegistered = false;
+
+    private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (intent == null) return;
+            boolean active = intent.getBooleanExtra(RadioService.EXTRA_ACTIVE, false);
+            String message = intent.getStringExtra(RadioService.EXTRA_MESSAGE);
+            updateWebState(active, message);
+        }
+    };
 
     @SuppressLint({"SetJavaScriptEnabled", "JavascriptInterface"})
     @Override protected void onCreate(Bundle savedInstanceState) {
@@ -28,7 +41,8 @@ public class MainActivity extends Activity {
         getWindow().setStatusBarColor(Color.BLACK);
         getWindow().setNavigationBarColor(Color.BLACK);
 
-        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, NOTIFICATION_PERMISSION_REQUEST);
         }
 
@@ -70,13 +84,43 @@ public class MainActivity extends Activity {
         }
     }
 
+    @Override protected void onStart() {
+        super.onStart();
+        if (!receiverRegistered) {
+            IntentFilter filter = new IntentFilter(RadioService.ACTION_STATUS);
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            else registerReceiver(statusReceiver, filter);
+            receiverRegistered = true;
+        }
+    }
+
+    @Override protected void onStop() {
+        if (receiverRegistered) {
+            unregisterReceiver(statusReceiver);
+            receiverRegistered = false;
+        }
+        super.onStop();
+    }
+
     private void syncWebState() {
-        if (webView == null) return;
         boolean active = RadioService.isActive();
-        String message = active
-                ? "Transmissão ativa. Você pode bloquear a tela."
-                : "Toque no botão para iniciar a transmissão.";
-        String js = "window.setNativeState && window.setNativeState(" + active + "," + quoteJs(message) + ");";
+        String message;
+        if (RadioService.isReconnecting()) {
+            message = "Reconectando ao vivo...";
+        } else if (RadioService.isPlaying()) {
+            message = "Você está ouvindo o Plataforma Livre ao vivo.";
+        } else if (active) {
+            message = "Conectando ao Plataforma Livre...";
+        } else {
+            message = "Toque no botão para iniciar a transmissão.";
+        }
+        updateWebState(active, message);
+    }
+
+    private void updateWebState(boolean active, String message) {
+        if (webView == null) return;
+        String safe = message == null ? "" : quoteJs(message);
+        String js = "window.setNativeState && window.setNativeState(" + active + "," + safe + ");";
         webView.evaluateJavascript(js, null);
     }
 
@@ -122,9 +166,7 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
-        public boolean isActive() {
-            return RadioService.isActive();
-        }
+        public boolean isActive() { return RadioService.isActive(); }
     }
 
     @Override protected void onResume() {
