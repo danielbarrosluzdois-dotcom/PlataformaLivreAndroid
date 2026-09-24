@@ -7,6 +7,9 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.drawable.Drawable;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
@@ -14,14 +17,24 @@ import android.media.MediaMetadata;
 import android.media.MediaPlayer;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 
 public class RadioService extends Service {
     public static final String ACTION_PLAY = "br.uerj.centrocultural.plataformalivre.PLAY";
     public static final String ACTION_STOP = "br.uerj.centrocultural.plataformalivre.STOP";
     public static final String ACTION_SET_VOLUME = "br.uerj.centrocultural.plataformalivre.SET_VOLUME";
+    public static final String ACTION_STATUS = "br.uerj.centrocultural.plataformalivre.STATUS";
+
     public static final String EXTRA_VOLUME = "volume";
+    public static final String EXTRA_ACTIVE = "active";
+    public static final String EXTRA_MESSAGE = "message";
 
     private static final String STREAM_URL = "https://servidor37-2.brlogic.com:7144/live";
     private static final String CHANNEL_ID = "plataforma_livre_radio";
@@ -29,34 +42,50 @@ public class RadioService extends Service {
 
     private static volatile boolean active = false;
     private static volatile boolean playing = false;
+    private static volatile boolean reconnecting = false;
 
     private MediaPlayer player;
     private MediaSession mediaSession;
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
     private AudioManager.OnAudioFocusChangeListener focusChangeListener;
+    private ConnectivityManager connectivityManager;
+    private ConnectivityManager.NetworkCallback networkCallback;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private Runnable reconnectRunnable;
+    private int reconnectAttempt = 0;
     private float volume = 0.85f;
 
     public static boolean isActive() { return active; }
     public static boolean isPlaying() { return playing; }
+    public static boolean isReconnecting() { return reconnecting; }
 
     @Override public void onCreate() {
         super.onCreate();
         createNotificationChannel();
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
 
         mediaSession = new MediaSession(this, "PlataformaLivreSession");
         mediaSession.setCallback(new MediaSession.Callback() {
             @Override public void onPlay() { startFreshStream(volume); }
             @Override public void onStop() { stopPlayback(); }
         });
-        mediaSession.setMetadata(new MediaMetadata.Builder()
+
+        Bitmap art = drawableToBitmap(R.drawable.ic_launcher);
+        MediaMetadata.Builder metadata = new MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, "Plataforma Livre")
                 .putString(MediaMetadata.METADATA_KEY_ARTIST, "Centro Cultural UERJ")
-                .putString(MediaMetadata.METADATA_KEY_ALBUM, "Ao Vivo")
-                .build());
+                .putString(MediaMetadata.METADATA_KEY_ALBUM, "Rádio ao vivo");
+        if (art != null) {
+            metadata.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, art);
+            metadata.putBitmap(MediaMetadata.METADATA_KEY_ART, art);
+        }
+        mediaSession.setMetadata(metadata.build());
         mediaSession.setActive(true);
         updatePlaybackState(PlaybackState.STATE_STOPPED);
+
+        registerNetworkCallback();
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -82,18 +111,38 @@ public class RadioService extends Service {
 
     private void startFreshStream(float requestedVolume) {
         volume = clamp(requestedVolume);
-        releasePlayer();
-
         active = true;
         playing = false;
-        updatePlaybackState(PlaybackState.STATE_CONNECTING);
-        startForeground(NOTIFICATION_ID, buildNotification("Conectando ao vivo..."));
+        reconnecting = false;
+        reconnectAttempt = 0;
+        cancelReconnect();
+        connectNow("Conectando ao Plataforma Livre...");
+    }
+
+    private void connectNow(String message) {
+        if (!active) return;
+
+        cancelReconnect();
+        releasePlayer();
+
+        playing = false;
+        reconnecting = message.toLowerCase().contains("reconect");
+        updatePlaybackState(reconnecting ? PlaybackState.STATE_BUFFERING : PlaybackState.STATE_CONNECTING);
+
+        startForeground(NOTIFICATION_ID, buildNotification(message));
+        broadcastStatus(message);
+
+        if (!hasInternet()) {
+            scheduleReconnect("Sem internet. Reconectando ao vivo...");
+            return;
+        }
 
         requestAudioFocus();
 
         try {
             MediaPlayer fresh = new MediaPlayer();
             player = fresh;
+
             fresh.setAudioAttributes(new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
@@ -105,39 +154,65 @@ public class RadioService extends Service {
                 if (!active || player != mp) return;
                 mp.start();
                 playing = true;
+                reconnecting = false;
+                reconnectAttempt = 0;
                 updatePlaybackState(PlaybackState.STATE_PLAYING);
                 updateNotification("Ao vivo • Centro Cultural UERJ");
+                broadcastStatus("Você está ouvindo o Plataforma Livre ao vivo.");
             });
 
             fresh.setOnErrorListener((mp, what, extra) -> {
-                if (player == mp) {
-                    active = false;
-                    playing = false;
+                if (active && player == mp) {
                     releasePlayer();
-                    updatePlaybackState(PlaybackState.STATE_ERROR);
-                    removeForegroundNotification();
-                    stopSelf();
+                    scheduleReconnect("Reconectando ao vivo...");
                 }
                 return true;
             });
 
             fresh.prepareAsync();
         } catch (Exception e) {
-            active = false;
-            playing = false;
             releasePlayer();
-            updatePlaybackState(PlaybackState.STATE_ERROR);
-            removeForegroundNotification();
-            stopSelf();
+            scheduleReconnect("Reconectando ao vivo...");
+        }
+    }
+
+    private void scheduleReconnect(String message) {
+        if (!active) return;
+
+        playing = false;
+        reconnecting = true;
+        updatePlaybackState(PlaybackState.STATE_BUFFERING);
+        updateNotification(message);
+        broadcastStatus(message);
+
+        cancelReconnect();
+        reconnectAttempt++;
+        long delay = Math.min(30000L, 1500L * (1L << Math.min(reconnectAttempt - 1, 4)));
+
+        reconnectRunnable = () -> {
+            reconnectRunnable = null;
+            if (active) connectNow("Reconectando ao vivo...");
+        };
+        handler.postDelayed(reconnectRunnable, delay);
+    }
+
+    private void cancelReconnect() {
+        if (reconnectRunnable != null) {
+            handler.removeCallbacks(reconnectRunnable);
+            reconnectRunnable = null;
         }
     }
 
     private void stopPlayback() {
         active = false;
         playing = false;
+        reconnecting = false;
+        reconnectAttempt = 0;
+        cancelReconnect();
         releasePlayer();
         abandonAudioFocus();
         updatePlaybackState(PlaybackState.STATE_STOPPED);
+        broadcastStatus("Transmissão parada. Ao tocar novamente, o app reconecta ao ponto atual do ao vivo.");
         removeForegroundNotification();
         stopSelf();
     }
@@ -151,17 +226,69 @@ public class RadioService extends Service {
         }
     }
 
+    private boolean hasInternet() {
+        if (connectivityManager == null) return true;
+        Network network = connectivityManager.getActiveNetwork();
+        if (network == null) return false;
+        NetworkCapabilities caps = connectivityManager.getNetworkCapabilities(network);
+        return caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+    }
+
+    private void registerNetworkCallback() {
+        if (connectivityManager == null) return;
+
+        networkCallback = new ConnectivityManager.NetworkCallback() {
+            @Override public void onAvailable(Network network) {
+                if (active && !playing) {
+                    handler.post(() -> {
+                        if (active && !playing) connectNow("Reconectando ao vivo...");
+                    });
+                }
+            }
+
+            @Override public void onLost(Network network) {
+                if (active) {
+                    handler.post(() -> {
+                        if (!active) return;
+                        releasePlayer();
+                        scheduleReconnect("Sem internet. Reconectando ao vivo...");
+                    });
+                }
+            }
+        };
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                connectivityManager.registerDefaultNetworkCallback(networkCallback);
+            } else {
+                NetworkRequest request = new NetworkRequest.Builder()
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        .build();
+                connectivityManager.registerNetworkCallback(request, networkCallback);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void unregisterNetworkCallback() {
+        if (connectivityManager != null && networkCallback != null) {
+            try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
+            networkCallback = null;
+        }
+    }
+
     private void updatePlaybackState(int state) {
         if (mediaSession == null) return;
         long actions = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_STOP;
         mediaSession.setPlaybackState(new PlaybackState.Builder()
                 .setActions(actions)
-                .setState(state, PlaybackState.PLAYBACK_POSITION_UNKNOWN, state == PlaybackState.STATE_PLAYING ? 1f : 0f)
+                .setState(state, PlaybackState.PLAYBACK_POSITION_UNKNOWN,
+                        state == PlaybackState.STATE_PLAYING ? 1f : 0f)
                 .build());
     }
 
     private void requestAudioFocus() {
-        if (audioManager == null) return;
+        if (audioManager == null || focusChangeListener != null) return;
+
         focusChangeListener = focusChange -> {
             if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
                 stopPlayback();
@@ -184,12 +311,17 @@ public class RadioService extends Service {
                     .build();
             audioManager.requestAudioFocus(focusRequest);
         } else {
-            audioManager.requestAudioFocus(focusChangeListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+            audioManager.requestAudioFocus(
+                    focusChangeListener,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN
+            );
         }
     }
 
     private void abandonAudioFocus() {
         if (audioManager == null) return;
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && focusRequest != null) {
             audioManager.abandonAudioFocusRequest(focusRequest);
             focusRequest = null;
@@ -199,9 +331,12 @@ public class RadioService extends Service {
         focusChangeListener = null;
     }
 
-    private void removeForegroundNotification() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE);
-        else stopForeground(true);
+    private void broadcastStatus(String message) {
+        Intent status = new Intent(ACTION_STATUS);
+        status.setPackage(getPackageName());
+        status.putExtra(EXTRA_ACTIVE, active);
+        status.putExtra(EXTRA_MESSAGE, message);
+        sendBroadcast(status);
     }
 
     private void createNotificationChannel() {
@@ -244,18 +379,41 @@ public class RadioService extends Service {
                 ? new Notification.Builder(this, CHANNEL_ID)
                 : new Notification.Builder(this);
 
-        return builder
-                .setSmallIcon(R.drawable.ic_launcher)
+        Bitmap logo = drawableToBitmap(R.drawable.ic_launcher);
+
+        builder.setSmallIcon(R.drawable.ic_stat_radio)
                 .setContentTitle("Plataforma Livre")
                 .setContentText(text)
+                .setSubText("Centro Cultural UERJ")
                 .setContentIntent(contentIntent)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setCategory(Notification.CATEGORY_SERVICE)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .addAction(stopAction)
-                .setStyle(style)
-                .build();
+                .setStyle(style);
+
+        if (logo != null) builder.setLargeIcon(logo);
+
+        return builder.build();
+    }
+
+    private Bitmap drawableToBitmap(int resId) {
+        try {
+            Drawable drawable = getDrawable(resId);
+            if (drawable == null) return null;
+            int width = Math.max(1, drawable.getIntrinsicWidth());
+            int height = Math.max(1, drawable.getIntrinsicHeight());
+            if (width <= 1) width = 512;
+            if (height <= 1) height = 512;
+            Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(bitmap);
+            drawable.setBounds(0, 0, canvas.getWidth(), canvas.getHeight());
+            drawable.draw(canvas);
+            return bitmap;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private void updateNotification(String text) {
@@ -263,16 +421,26 @@ public class RadioService extends Service {
         if (manager != null) manager.notify(NOTIFICATION_ID, buildNotification(text));
     }
 
+    private void removeForegroundNotification() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE);
+        else stopForeground(true);
+    }
+
     @Override public void onDestroy() {
         active = false;
         playing = false;
+        reconnecting = false;
+        cancelReconnect();
         releasePlayer();
         abandonAudioFocus();
+        unregisterNetworkCallback();
+
         if (mediaSession != null) {
             mediaSession.setActive(false);
             mediaSession.release();
             mediaSession = null;
         }
+
         super.onDestroy();
     }
 
