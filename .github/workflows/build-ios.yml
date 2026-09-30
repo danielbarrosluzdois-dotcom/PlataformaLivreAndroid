@@ -1,0 +1,59 @@
+name: Build iOS App
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "ios/**"
+      - ".github/workflows/build-ios.yml"
+
+concurrency:
+  group: build-ios-main
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen and SVG renderer
+        run: |
+          brew install xcodegen librsvg
+
+      - name: Generate iOS app icons and splash logo
+        run: |
+          cd ios/PlataformaLivre
+          mkdir -p Assets.xcassets/AppIcon.appiconset
+          mkdir -p Assets.xcassets/AppLogo.imageset
+
+          for spec in "40 icon-40.png" "60 icon-60.png" "58 icon-58.png" "87 icon-87.png" "80 icon-80.png" "120 icon-120.png" "120 icon-120-home.png" "180 icon-180.png" "1024 icon-1024.png"; do
+            set -- $spec
+            rsvg-convert -w "$1" -h "$1" Resources/appicon.svg > "Assets.xcassets/AppIcon.appiconset/$2"
+          done
+
+          rsvg-convert -w 1024 -h 1024 Resources/appicon.svg > Assets.xcassets/AppLogo.imageset/AppLogo.png
+
+      - name: Generate Xcode project
+        run: |
+          cd ios/PlataformaLivre
+          xcodegen generate
+
+      - name: Build for iPhone Simulator
+        run: |
+          cd ios/PlataformaLivre
+          xcodebuild             -project PlataformaLivre.xcodeproj             -scheme PlataformaLivre             -configuration Debug             -sdk iphonesimulator             -destination 'generic/platform=iOS Simulator'             -derivedDataPath build             CODE_SIGNING_ALLOWED=NO             build
+
+      - name: Package simulator app
+        run: |
+          cd ios/PlataformaLivre
+          ditto -c -k --sequesterRsrc --keepParent             build/Build/Products/Debug-iphonesimulator/PlataformaLivre.app             Plataforma_Livre_iOS_Simulator.zip
+
+      - name: Upload simulator build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Plataforma-Livre-iOS-Simulator
+          path: ios/PlataformaLivre/Plataforma_Livre_iOS_Simulator.zip
+          retention-days: 30
